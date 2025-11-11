@@ -19,7 +19,7 @@ class IBDLoader(ABC):
 
         self.min_segment_length = min_segment_length
         self.min_total_ibd = min_total_ibd
-        self.genetic_map = genetic_map
+        self.genetic_map = genetic_map  # aDNA: allow passing map at construction time for per-chr loads
 
     @abstractmethod
     def scan_file(self, file_path: str) -> pl.LazyFrame:
@@ -139,6 +139,7 @@ class HapIBDLoader(IBDLoader):
             }
         )
 
+        # Convert haplotype indexing from 1/2 to 0/1 (internal convention)
         return df.with_columns([
                 (pl.col('id1_haplotype') - 1).alias('id1_haplotype'),
                 (pl.col('id2_haplotype') - 1).alias('id2_haplotype')
@@ -149,7 +150,10 @@ class HapIBDLoader(IBDLoader):
     
     def custom_process(self, df: pl.DataFrame, **kwargs) -> pl.DataFrame:
         """Convert bp coordinates to cm using genetic map interpolation."""
-        genetic_map = kwargs["genetic_map"]
+        # aDNA: be flexible—use map from kwargs if provided, else fall back to self.genetic_map.
+        genetic_map: Optional[GeneticMap] = kwargs.get("genetic_map", None) or self.genetic_map
+        if genetic_map is None:
+            raise ValueError("HapIBDLoader requires a GeneticMap (pass as 'genetic_map' or via constructor).")
         
         # Convert start_bp to start_cm
         start_bp_array = df.get_column("start_bp").to_numpy()
@@ -179,22 +183,32 @@ def load_ibd_from_file(file_paths: List[Path], ibd_caller: str, min_segment_leng
 
     loader_class = ibd_caller_dict[ibd_caller]
 
+    # aDNA: allow passing a GeneticMap at construction (esp. for per-chromosome input).
+    loader = loader_class(min_segment_length, min_total_ibd, genetic_map=kwargs.get("genetic_map"))
+
+    # Normalize input (support Path or List[Path])
+    if isinstance(file_paths, (str, Path)):
+        file_paths = [Path(file_paths)]
+    else:
+        file_paths = [Path(p) for p in file_paths]
+
     single_file = len(file_paths) == 1
 
-    # If multiple files, cannot filter based on min_total_ibd (since loading only for each chromosome)
-    loader = loader_class(min_segment_length, min_total_ibd if single_file else min_segment_length)
+    # If multiple files, cannot filter by genome-wide min_total_ibd during per-chrom read;
+    # we load with segment-length filter, concat, then filter by total IBD at the end.
+    effective_total_ibd = min_total_ibd if single_file else min_segment_length
+    loader.min_total_ibd = effective_total_ibd
 
     ibd_segments_list = []
 
     for file_path in file_paths:
-        ibd_segments_list.append(loader.load_filtered_segments(file_path, **kwargs))
+        ibd_segments_list.append(loader.load_filtered_segments(str(file_path), **kwargs))
 
     if single_file:
         ibd_segments = ibd_segments_list[0]
-    # Multiple files added; must concagt and then filter on total ibd
     else:
         ibd_segments = pl.concat(ibd_segments_list)
-
+        # Now apply the genome-wide total IBD filter across all chromosomes
         ibd_segments = loader.filter_pairs(ibd_segments, min_total_ibd)
     
     return ibd_segments.to_pandas() if to_pandas else ibd_segments
@@ -295,12 +309,17 @@ class Individuals:
                              names=["iid", "age"],
                              dtype={"iid": str, "age": float})
 
-        assert (age_df["age"] > 1000).all() or (age_df["age"] <= 1000).all()
-
-        # Years of birth are given
-        if (age_df["age"] > 1000).all():
-            cur_year = datetime.now().year
+        # aDNA: Do NOT blindly convert any value >1000 to an age.
+        # Many aDNA datasets store radiocarbon years BP (e.g., 2500),
+        # which would be misinterpreted. We only treat values as Year-of-Birth
+        # when they look like plausible calendar years (e.g., 1850..current_year).
+        cur_year = datetime.now().year
+        plausible_yob = (age_df["age"] >= 1850) & (age_df["age"] <= cur_year)
+        if plausible_yob.all():
+            # Years of birth are given -> convert to (approximate) current age
             age_df["age"] = cur_year - age_df["age"]
+        # else: treat provided numbers as "age" already (e.g., age-at-death, or BP).
+        #       We keep as-is to avoid distorting aDNA inputs.
 
         for row in age_df.itertuples():
             self._add_iid(row.iid, row.age, self.AGE)
@@ -588,24 +607,25 @@ def load_individuals(config: FilesConfig) -> Individuals:
 
 def load_pairs(files: FilesConfig, alg_args: AlgorithmConfig) -> Pairs:
 
+    # aDNA: use the unified, validated list from FilesConfig (supports single or per-chrom files).
+    # NOTE: call files.validate() before this to populate ibd_file_list.
+    ibd_paths: List[Path] = files.ibd_file_list if hasattr(files, "ibd_file_list") else [files.ibd]
+
+    # Build kwargs for hap-ibd map if caller requires it; rely on upstream to construct GeneticMap if needed.
+    kwargs: Dict[str, Any] = {}
+    # If the map list was validated/constructed into a GeneticMap upstream, it can be passed here.
+    # (Left as empty here; CLI/config layer often handles constructing GeneticMap.)
+
     # Load the IBD segments
-    ibd_segments = load_ibd_from_file(files.ibd, files.ibd_caller, alg_args.min_segment_length, alg_args.min_total_ibd)
+    ibd_segments = load_ibd_from_file(
+        ibd_paths,
+        files.ibd_caller,
+        alg_args.min_segment_length,
+        alg_args.min_total_ibd,
+        **kwargs
+    )
 
     # Add the IBD segments to the pairs
     pairs = Pairs.from_segment_df(ibd_segments)
     
     return pairs
-
-
-
-
-
-
-
-        
-
-
-
-
-
-
