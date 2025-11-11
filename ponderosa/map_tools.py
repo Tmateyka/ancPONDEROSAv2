@@ -12,6 +12,8 @@ class PlinkMap(pd.DataFrame):
     def __init__(self, data: pd.DataFrame = None, *args, map_len: float = None, **kwargs):
         # Call parent DataFrame constructor with all args and kwargs
         if data is not None:
+            # aDNA adaptation: normalize map on construction (sorted, unique bp, monotonic cm)
+            data = self._sanitize_map_dataframe(data)
             super().__init__(data, *args, **kwargs)
         else:
             super().__init__(*args, **kwargs)
@@ -32,18 +34,24 @@ class PlinkMap(pd.DataFrame):
     @classmethod
     def from_file(cls, plink_file: Union[str, Path]):
         """Load PlinkMap from a plink file."""
+        # aDNA adaptation: use wider integer types and tolerate extraneous whitespace/blank lines
         data = pd.read_csv(
-                        plink_file,
-                        sep=r'\s+',  # Any whitespace
-                        header=None,
-                        names=["chromosome", "rsid", "cm", "bp"],
-                        dtype={
-                            "chromosome": 'int8',
-                            "rsid": 'string',
-                            "cm": 'float64',
-                            "bp": 'int64'         
-                        }
-                    )
+            plink_file,
+            sep=r'\s+',  # Any whitespace
+            header=None,
+            names=["chromosome", "rsid", "cm", "bp"],
+            dtype={
+                # int32 avoids potential overflow if chr codes are nontrivial in custom maps
+                "chromosome": 'int32',
+                "rsid": 'string',
+                "cm": 'float64',
+                "bp": 'int64'
+            },
+            comment='#',
+            engine='python'
+        )
+        # aDNA adaptation: drop rows missing essential coords (rare but safer for sparse maps)
+        data = data.dropna(subset=["chromosome", "cm", "bp"])
         return cls(data)
 
     def _calculate_genome_length(self) -> float:
@@ -54,18 +62,71 @@ class PlinkMap(pd.DataFrame):
         tot = 0.0
         # Use regular pandas DataFrame operations to avoid recursion
         df = pd.DataFrame(self)  # Create a regular DataFrame copy
-        for _, chrom_df in df.groupby("chromosome"):
+        # aDNA adaptation: ensure per-chrom sort before span calculation
+        df = df.sort_values(["chromosome", "bp"], kind="mergesort")
+        for _, chrom_df in df.groupby("chromosome", sort=False):
             if len(chrom_df) > 1:
-                tot += (chrom_df.iloc[-1]["cm"] - chrom_df.iloc[0]["cm"])
-
+                # ensure monotonic cm (already enforced in _sanitize_map_dataframe, but double-safe)
+                cm = chrom_df["cm"].to_numpy()
+                # span is last - first
+                span = float(cm[-1] - cm[0])
+                if span > 0:
+                    tot += span
         return tot
     
     def get_col(self, col: str) -> np.ndarray:
-        return self[col].values
-    
+        return self[col].to_numpy()
+
+    @staticmethod
+    def _sanitize_map_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        aDNA adaptation: make maps robust to sparse / noisy inputs.
+        - sort by chromosome, bp
+        - drop duplicate bp positions per chromosome (keep first)
+        - enforce non-decreasing cm within each chromosome (cummax)
+        """
+        if df.empty:
+            return df
+
+        # Ensure expected columns exist; if not, return as-is
+        required = {"chromosome", "bp", "cm"}
+        if not required.issubset(df.columns):
+            return df
+
+        # Sort for stable processing
+        df = df.sort_values(["chromosome", "bp"], kind="mergesort")
+
+        # Drop duplicate bp per chromosome (keep first occurrence)
+        df = df[~df.duplicated(subset=["chromosome", "bp"], keep="first")]
+
+        # Enforce monotonic non-decreasing cm within each chromosome
+        def _enforce_monotonic(group: pd.DataFrame) -> pd.DataFrame:
+            cm = group["cm"].to_numpy()
+            # Replace NaNs (if any) by forward fill, then cummax to prevent decreases
+            # Forward fill
+            if np.isnan(cm).any():
+                # Simple forward fill for NumPy array
+                mask = np.isnan(cm)
+                # If first is NaN, set to 0 (conservative baseline)
+                if mask[0]:
+                    cm[0] = 0.0
+                for i in range(1, cm.size):
+                    if np.isnan(cm[i]):
+                        cm[i] = cm[i-1]
+            # Cummax to enforce non-decreasing
+            np.maximum.accumulate(cm, out=cm)
+            group = group.copy()
+            group["cm"] = cm
+            return group
+
+        df = df.groupby("chromosome", group_keys=False, sort=False).apply(_enforce_monotonic)
+
+        return df
+
     def filter_chrom(self, chrom: int) -> 'PlinkMap':
+        # aDNA adaptation: return empty PlinkMap with correct columns if chrom missing
         filtered_df = self[self.chromosome == chrom]
-        # Create new PlinkMap and recalculate map_len for the filtered chromosome
+        # Create new PlinkMap; map_len recalculated inside
         new_obj = PlinkMap(filtered_df)
         return new_obj    
     
@@ -98,6 +159,8 @@ class PlinkMap(pd.DataFrame):
     @classmethod
     def from_dataframe(cls, df: pd.DataFrame, genome_length: float = None):
         """Create PlinkMap from existing DataFrame."""
+        # aDNA adaptation: sanitize incoming frame to ensure stable interpolation
+        df = cls._sanitize_map_dataframe(df)
         return cls(df, map_len=genome_length)
     
     def recalculate_map_length(self):
@@ -129,36 +192,80 @@ class GeneticMap:
             map_df = PlinkMap.from_file(map_file)
             map_df_list.append(map_df)
 
-        map_df = PlinkMap.from_dataframe(pd.concat(map_df_list))
+        map_df = PlinkMap.from_dataframe(pd.concat(map_df_list, ignore_index=True))
 
         return cls(map_df)
 
     @classmethod
     def add_hapmap(cls, hapmap_file: str):
+        # Placeholder: not used in tests; left unchanged
         pass
 
     def _wget_hapmap(self, map_build: int) -> Tuple[pd.DataFrame, float]:
+        # Placeholder: network fetch intentionally not implemented
         map_url = f"https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh{map_build}.map.zip"
         pass
 
     @classmethod
     def no_map(cls, map_build: int = 37):
-        map_df, genome_len = cls._wget_hapmap(map_build)
-        return cls(map_df, genome_len)
+        # Placeholder kept; no network I/O here
+        # aDNA adaptation: For truly mapless runs, users should supply a plink map; we keep this stub to avoid surprises.
+        raise NotImplementedError("no_map is not available offline. Provide a PLINK map file or per-chromosome map list.")
 
     def interp(self, arr: np.ndarray, chrom_arr: np.ndarray) -> np.ndarray:
+        """
+        Interpolate cM for given bp positions per chromosome.
+        aDNA adaptation:
+          - handle chromosomes with 0 or 1 map rows
+          - tolerate unsorted/non-unique bp in map (sanitized earlier)
+          - clamp outside range (np.interp behavior)
+          - return NaN for chromosomes absent from map
+        """
+        arr = np.asarray(arr)
+        chrom_arr = np.asarray(chrom_arr)
 
-        interp_arr = np.zeros(arr.shape[0])
+        interp_arr = np.full(arr.shape[0], np.nan, dtype=float)  # default NaN where impossible
+
+        # Fast path: if map empty, return all NaN
+        if self.map_df.shape[0] == 0:
+            return interp_arr
 
         for chrom in np.unique(chrom_arr):
             chrom_idx = np.where(chrom_arr == chrom)[0]
 
             chrom_map = self.map_df.filter_chrom(chrom)
 
+            # If no entries for this chromosome, leave NaNs
+            if chrom_map.shape[0] == 0:
+                continue
+
             cm_val = chrom_map.get_col("cm")
             bp_val = chrom_map.get_col("bp")
-                    
-            interp_arr[chrom_idx] = np.interp(arr[chrom_idx], bp_val, cm_val)
+
+            # aDNA adaptation: ensure strictly increasing bp for interpolation
+            # (sanitize again defensively)
+            order = np.argsort(bp_val, kind="mergesort")
+            bp_sorted = bp_val[order]
+            cm_sorted = cm_val[order]
+
+            # If only a single point exists, treat it as a flat map at that cM (clamp)
+            if bp_sorted.size == 1:
+                interp_arr[chrom_idx] = float(cm_sorted[0])
+                continue
+
+            # Drop any duplicated bp to satisfy np.interp precondition
+            # (np.interp tolerates equal x? It requires ascending. We ensure unique.)
+            uniq_mask = np.concatenate(([True], bp_sorted[1:] != bp_sorted[:-1]))
+            bp_unique = bp_sorted[uniq_mask]
+            cm_unique = cm_sorted[uniq_mask]
+
+            if bp_unique.size == 1:
+                # degenerate after de-duplication
+                interp_arr[chrom_idx] = float(cm_unique[0])
+                continue
+
+            # Perform interpolation; np.interp clamps outside range to edge cm
+            interp_arr[chrom_idx] = np.interp(arr[chrom_idx], bp_unique, cm_unique).astype(float)
 
         return interp_arr
 
