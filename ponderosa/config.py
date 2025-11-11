@@ -51,15 +51,18 @@ class FilesConfig:
     ibd_files: Optional[List[Path]] = None
     _ibd_file_list: Optional[List[Path]] = field(default=None, init=False)
 
-    # aDNA: optional inputs for low-coverage/inbred ancient samples
-    kin_file: Optional[Path] = None             # e.g., lcMLkin/KIN pairwise output
-    read_file: Optional[Path] = None            # READ pairwise output
-    haproh_file: Optional[Path] = None          # hapROH per-individual summary
-    haproh_files: Optional[List[Path]] = None   # allow multiple hapROH files
+    # aDNA: allow optional ROH inputs (e.g., hapROH output or precomputed ROH bed/tsv)
+    roh: Optional[Path] = None                     # single ROH file
+    roh_files: Optional[List[Path]] = None         # list of per-chrom or multi-file ROH
+    roh_format: Optional[str] = None               # e.g., "haproh", "bed", "eigenstrat-roh"
+    _roh_file_list: Optional[List[Path]] = field(default=None, init=False)
+
+    # aDNA: optional KING-like kinship table to seed founders/sim (used elsewhere, keep here for consistency)
+    king: Optional[Path] = None
 
     def _validate_file_lists(self, single_file: Path, file_list: List[Path], file_type: str) -> List[Path]:
 
-        single_file_arg = lambda x: {"map": "mapf", "ibd": "ibd"}[x]
+        single_file_arg = lambda x: {"map": "mapf", "ibd": "ibd", "roh": "roh"}[x]  # aDNA: added roh
         multiple_file_arg = lambda x: f"{x}_files"
 
         if single_file and file_list:
@@ -69,7 +72,8 @@ class FilesConfig:
             if not single_file.exists():
                 raise FileNotFoundError(f"{single_file_arg(file_type)} file not found: {single_file}")
             
-            if "chr1" in single_file.name: # Populate with all other chromosomes
+            # Preserve original behavior for .map pattern completion
+            if file_type == "map" and "chr1" in single_file.name: # Populate with all other chromosomes
                 out_list = [single_file.with_name(single_file.name.replace("chr1", f"chr{i}")) for i in range(1, 23)]
             else:
                 out_list = [single_file]
@@ -79,14 +83,14 @@ class FilesConfig:
                 raise ValueError(f"{multiple_file_arg(file_type)} list cannot be empty")
             out_list = []
             for i, file_n in enumerate(file_list):
-                if not file_n.exists():
+                if not Path(file_n).exists():
                     raise FileNotFoundError(f"{multiple_file_arg(file_type)} file not found: {file_n} (index {i})")
-                out_list.append(file_n)
+                out_list.append(Path(file_n))
 
         else:
-            # aDNA: in KIN/READ-only mode there may be no IBD or MAP files; caller controls when we use this helper.
-            # leaving behavior unchanged for the legacy segments pipeline (we do NOT raise here to avoid changing flow)
-            raise ValueError(f"{file_type} file(s) have not been provided. Specify either '{single_file_arg(file_type)}' or '{multiple_file_arg(file_type)}'.")  # FIX: ensure this actually raises
+            # NOTE: original code had a ValueError but didn’t raise it — fix to actually raise.
+            raise ValueError(f"{file_type} file(s) have not been provided. "
+                             f"Specify either '{single_file_arg(file_type)}' or '{multiple_file_arg(file_type)}'.")
 
         return out_list
     
@@ -97,57 +101,39 @@ class FilesConfig:
         for file_path in required_files:
             if not file_path.exists():
                 raise FileNotFoundError(f"Required file not found: {file_path}")
-        
-        # Determine input mode(s)
-        has_ibd = bool(self.ibd or self.ibd_files)
-        has_kin_read = bool(self.kin_file or self.read_file)  # aDNA
-
-        # aDNA: validate KIN/READ/hapROH paths if provided (non-fatal warnings if missing)
-        for optional_path, label in [
-            (self.kin_file, "kin_file"),
-            (self.read_file, "read_file"),
-            (self.haproh_file, "haproh_file"),
-        ]:
-            if optional_path and not Path(optional_path).exists():
-                logger.warning(f"Optional aDNA file not found: {label} -> {optional_path}")
-
-        if self.haproh_files:
-            for i, hp in enumerate(self.haproh_files):
-                if not Path(hp).exists():
-                    logger.warning(f"Optional aDNA file not found: haproh_files[{i}] -> {hp}")
-        
-        # Legacy segments-based pipeline (unchanged): require IBD + MAP (MAP strongly recommended for hap-ibd)
-        if has_ibd:
+            
+        # map + ibd lists (existing behavior)
+        if self.ibd or self.ibd_files:
             self._ibd_file_list = self._validate_file_lists(self.ibd, self.ibd_files, "ibd")
-            # Only require maps when a map-driven caller is used; we keep parity with your tests which supply mapf
-            try:
-                self._map_file_list = self._validate_file_lists(self.mapf, self.map_files, "map")
-            except ValueError as e:
-                # If the caller is hap-ibd, maps are expected; otherwise allow missing maps.
-                caller = (self.ibd_caller or "").lower()
-                if caller in {"hap-ibd", "hapibd"}:
-                    raise
-                else:
-                    # no map needed for callers that emit cM lengths directly
-                    self._map_file_list = []
         else:
-            # aDNA: allow KIN/READ-only mode (no IBD segments), typically used for ultra-low coverage/pseudo-haploid data
-            if has_kin_read:
-                self._ibd_file_list = []
-                self._map_file_list = []
-                logger.info("aDNA mode: proceeding without IBD segment files (KIN/READ provided).")
-            else:
-                # No IBD and no aDNA surrogates => nothing to analyze
-                raise ValueError(
-                    "No IBD files provided and no aDNA surrogates (kin/read). "
-                    "Provide 'ibd'/'ibd_files' OR 'kin_file'/'read_file'."
-                )
+            # Keep optional (some runs may be training-only or simulation)
+            self._ibd_file_list = []
+
+        if self.mapf or self.map_files:
+            self._map_file_list = self._validate_file_lists(self.mapf, self.map_files, "map")
+        else:
+            self._map_file_list = []
+
+        # aDNA: validate optional roh lists if provided
+        if self.roh or self.roh_files:
+            self._roh_file_list = self._validate_file_lists(self.roh, self.roh_files, "roh")
+        else:
+            self._roh_file_list = []
 
         # Check optional files if provided
-        optional_files = [self.ages, self.mapf, self.populations, self.training, self.priors, self.rel_tree]
+        optional_files = [self.ages, self.mapf, self.populations, self.training, self.priors, self.king, self.roh]
         for file_path in optional_files:
             if file_path and not Path(file_path).exists():
                 logger.warning(f"Optional file not found: {file_path}")
+
+        # aDNA: light validation of roh_format when ROH files exist
+        if self._roh_file_list and not self.roh_format:
+            # default to hapROH when ROH files are provided but no format specified
+            self.roh_format = "haproh"
+        if self.roh_format:
+            allowed = {"haproh", "bed", "eigenstrat-roh"}
+            if self.roh_format.lower() not in allowed:
+                raise ValueError(f"Invalid roh_format='{self.roh_format}'. Allowed: {sorted(allowed)}")
 
     @property
     def map_file_list(self) -> List[Path]:
@@ -158,10 +144,18 @@ class FilesConfig:
     
     @property
     def ibd_file_list(self) -> List[Path]:
-        """Return unified list of map files. Must call validate() first."""
+        """Return unified list of IBD files. Must call validate() first."""
         if self._ibd_file_list is None:
-            raise RuntimeError("Must call validate() before accessing map_file_list")
+            raise RuntimeError("Must call validate() before accessing ibd_file_list")
         return self._ibd_file_list
+
+    @property
+    def roh_file_list(self) -> List[Path]:
+        """aDNA: unified list of ROH files (hapROH/bed/etc). Must call validate() first."""
+        if self._roh_file_list is None:
+            raise RuntimeError("Must call validate() before accessing roh_file_list")
+        return self._roh_file_list
+
 
 @dataclass 
 class AlgorithmConfig:
@@ -188,12 +182,15 @@ class AlgorithmConfig:
     validate_pair_order: bool = True
     parallel_processing: bool = True
 
-    # aDNA: knobs for degraded/low-coverage data
-    pseudo_haploid: bool = False                 # treat data as pseudo-haploid if caller prepared it that way
-    min_overlap_snps: int = 0                    # minimum shared SNPs for pair to be considered (for KIN/READ)
-    trim_damage_bases: Optional[int] = None      # soft-trim deaminated ends if upstream didn’t
-    min_pairs_for_normalization: int = 0         # READ normalization cohort size (0 = no extra requirement)
-    allow_no_segments: bool = True               # permit KIN/READ-only workflows
+    # aDNA: optional knobs to sensibly integrate ROH and ancient data quality (kept OFF by default)
+    ancient_mode: bool = False                        # enable aDNA defaults elsewhere (no behavior change here)
+    use_roh_priors: bool = False                      # when True, allow ROH-informed priors downstream
+    roh_min_cm: float = 4.0                           # minimum ROH length (cM) to consider in summaries
+    roh_merge_gap_cm: float = 0.5                     # merge gap for ROH stitching in summaries
+    use_damage_aware: bool = False                    # if pipeline supports PMD-aware genotype handling
+    min_coverage: float = 0.0                         # optional per-sample min coverage recorded by loaders
+    max_contamination: float = 1.0                    # optional per-sample max contamination tolerated (record only)
+
 
 @dataclass
 class OutputConfig:
@@ -217,6 +214,10 @@ class OutputConfig:
     # Logging
     log_level: str = "INFO"
     verbose: bool = False
+
+    # aDNA: (optional) write ROH summaries
+    write_roh_summary: bool = False                  # when True, downstream can emit {prefix}_roh_summary.txt
+
 
 @dataclass
 class PonderosaConfig:
@@ -246,12 +247,9 @@ class PonderosaConfig:
         files_dict = config_dict.get("files", {})
         
         # Single path fields (convert to Path objects)
-        single_path_fields = {
-            'ibd', 'fam', 'ages', 'mapf', 'populations', 'training', 'rel_tree',
-            # aDNA:
-            'kin_file', 'read_file', 'haproh_file'
-        }
-        for key, value in list(files_dict.items()):
+        # aDNA: include new optional paths ('king', 'roh')
+        single_path_fields = {'ibd', 'fam', 'ages', 'mapf', 'populations', 'training', 'rel_tree', 'king', 'roh'}
+        for key, value in files_dict.items():
             if value is not None and key in single_path_fields:
                 files_dict[key] = Path(value)
         
@@ -260,8 +258,8 @@ class PonderosaConfig:
             files_dict['map_files'] = [Path(f) for f in files_dict['map_files']]
         if 'ibd_files' in files_dict and files_dict['ibd_files'] is not None:
             files_dict['ibd_files'] = [Path(f) for f in files_dict['ibd_files']]
-        if 'haproh_files' in files_dict and files_dict['haproh_files'] is not None:  # aDNA
-            files_dict['haproh_files'] = [Path(f) for f in files_dict['haproh_files']]
+        if 'roh_files' in files_dict and files_dict['roh_files'] is not None:     # aDNA
+            files_dict['roh_files'] = [Path(f) for f in files_dict['roh_files']]
         
         # Create nested config objects
         files_config = FilesConfig(**files_dict)
@@ -288,17 +286,16 @@ class PonderosaConfig:
         # Override with CLI arguments
         # Map flat CLI args to nested structure
         file_args = [
-            "ibd", "fam", "ages", "mapf", "populations", "training", "ibd_caller",
-            # aDNA:
-            "kin_file", "read_file"
+            "ibd", "fam", "ages", "mapf", "populations", "training",
+            "ibd_caller", "rel_tree", "king", "roh"  # aDNA
         ]
         algorithm_args = [
             "min_segment_length", "min_total_ibd", "population", "genome_length",
-            # aDNA:
-            "pseudo_haploid", "min_overlap_snps", "trim_damage_bases",
-            "min_pairs_for_normalization", "allow_no_segments"
+            # aDNA knobs (optional)
+            "ancient_mode", "use_roh_priors", "roh_min_cm", "roh_merge_gap_cm",
+            "use_damage_aware", "min_coverage", "max_contamination"
         ]
-        output_args = ["output", "min_probability", "verbose"]
+        output_args = ["output", "min_probability", "verbose", "write_roh_summary"]  # aDNA
         
         for arg, value in cli_args.items():
             if value is not None:
@@ -308,62 +305,65 @@ class PonderosaConfig:
                     config_dict["algorithm"][arg] = value
                 elif arg in output_args:
                     config_dict["output"][arg] = value
+                elif arg in ("map_files", "ibd_files", "roh_files"):    # aDNA lists
+                    config_dict.setdefault("files", {})[arg] = value
         
         return cls.from_dict(config_dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
-        # aDNA: added explicit, accurate keys; removed non-existent 'king'/'map' keys from earlier draft
+        # NOTE: original version referenced self.files.king and self.files.map
+        # while FilesConfig had no 'king' and used 'mapf'. We added 'king' above and
+        # keep the outward YAML key as 'map' for compatibility.
         return {
             "files": {
                 "ibd": str(self.files.ibd) if self.files.ibd else None,
-                "ibd_files": [str(p) for p in (self.files.ibd_files or [])] if self.files.ibd_files else None,
                 "fam": str(self.files.fam),
-                "ibd_caller": self.files.ibd_caller,
+                "king": str(self.files.king) if self.files.king else None,            # aDNA: present but optional
                 "ages": str(self.files.ages) if self.files.ages else None,
-                "mapf": str(self.files.mapf) if self.files.mapf else None,
-                "map_files": [str(p) for p in (self.files.map_files or [])] if self.files.map_files else None,
+                "map": str(self.files.mapf) if self.files.mapf else None,             # keep outward name 'map'
+                "map_files": [str(p) for p in (self.files.map_files or [])] or None,
+                "ibd_files": [str(p) for p in (self.files.ibd_files or [])] or None,
                 "populations": str(self.files.populations) if self.files.populations else None,
                 "training": str(self.files.training) if self.files.training else None,
                 "rel_tree": str(self.files.rel_tree) if self.files.rel_tree else None,
-                "priors": str(self.files.priors) if self.files.priors else None,
-                # aDNA:
-                "kin_file": str(self.files.kin_file) if self.files.kin_file else None,
-                "read_file": str(self.files.read_file) if self.files.read_file else None,
-                "haproh_file": str(self.files.haproh_file) if self.files.haproh_file else None,
-                "haproh_files": [str(p) for p in (self.files.haproh_files or [])] if self.files.haproh_files else None,
+                # aDNA outputs
+                "roh": str(self.files.roh) if self.files.roh else None,
+                "roh_files": [str(p) for p in (self.files.roh_files or [])] or None,
+                "roh_format": self.files.roh_format
             },
             "algorithm": {
                 "min_segment_length": self.algorithm.min_segment_length,
                 "min_total_ibd": self.algorithm.min_total_ibd,
                 "max_gap": self.algorithm.max_gap,
                 "use_phase_correction": self.algorithm.use_phase_correction,
-                "mean_phase_error_distance": self.algorithm.mean_phase_error_distance,
-                "degree_threshold": self.algorithm.degree_threshold,
-                "haplotype_threshold": self.algorithm.haplotype_threshold,
                 "population": self.algorithm.population,
                 "genome_length": self.algorithm.genome_length,
                 "validate_pair_order": self.algorithm.validate_pair_order,
                 "parallel_processing": self.algorithm.parallel_processing,
-                # aDNA:
-                "pseudo_haploid": self.algorithm.pseudo_haploid,
-                "min_overlap_snps": self.algorithm.min_overlap_snps,
-                "trim_damage_bases": self.algorithm.trim_damage_bases,
-                "min_pairs_for_normalization": self.algorithm.min_pairs_for_normalization,
-                "allow_no_segments": self.algorithm.allow_no_segments,
+                # aDNA knobs
+                "ancient_mode": self.algorithm.ancient_mode,
+                "use_roh_priors": self.algorithm.use_roh_priors,
+                "roh_min_cm": self.algorithm.roh_min_cm,
+                "roh_merge_gap_cm": self.algorithm.roh_merge_gap_cm,
+                "use_damage_aware": self.algorithm.use_damage_aware,
+                "min_coverage": self.algorithm.min_coverage,
+                "max_contamination": self.algorithm.max_contamination,
             },
             "output": {
                 "output": self.output.output,
                 "min_probability": self.output.min_probability,
                 "write_readable": self.output.write_readable,
+                "verbose": self.output.verbose,
+                "write_training": self.output.write_training,
                 "write_pickle": self.output.write_pickle,
                 "write_detailed": self.output.write_detailed,
-                "write_training": self.output.write_training,
+                # aDNA
+                "write_roh_summary": self.output.write_roh_summary,
                 "create_plots": self.output.create_plots,
                 "plot_format": self.output.plot_format,
                 "plot_dpi": self.output.plot_dpi,
-                "log_level": self.output.log_level,
-                "verbose": self.output.verbose
+                "log_level": self.output.log_level
             }
         }
     
@@ -380,15 +380,15 @@ class PonderosaConfig:
         
         if not 0 <= self.output.min_probability <= 1:
             raise ValueError("min_probability must be between 0 and 1")
-
-        # aDNA: soft checks; keep permissive
-        if self.algorithm.min_overlap_snps < 0:
-            raise ValueError("min_overlap_snps must be >= 0")
-        if self.algorithm.trim_damage_bases is not None and self.algorithm.trim_damage_bases < 0:
-            raise ValueError("trim_damage_bases must be >= 0")
-        if self.algorithm.min_pairs_for_normalization < 0:
-            raise ValueError("min_pairs_for_normalization must be >= 0")
         
+        # aDNA: sanity checks (do not enforce behavior yet)
+        if self.algorithm.roh_min_cm < 0:
+            raise ValueError("roh_min_cm must be non-negative")
+        if self.algorithm.roh_merge_gap_cm < 0:
+            raise ValueError("roh_merge_gap_cm must be non-negative")
+        if not (0.0 <= self.algorithm.max_contamination <= 1.0):
+            raise ValueError("max_contamination must be within [0,1]")
+
         logger.info("Configuration validation passed")
     
     def save_yaml(self, output_path: Union[str, Path]) -> None:
@@ -399,3 +399,4 @@ class PonderosaConfig:
             yaml.dump(self.to_dict(), f, default_flow_style=False, indent=2)
         
         logger.info(f"Configuration saved to {output_path}")
+
